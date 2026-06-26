@@ -5,7 +5,7 @@ Sync terremotovenezuela.com (Supabase) -> Feature Layer alojado en ArcGIS Online
 - Lee la tabla `buildings` de Supabase (clave publishable, lectura pública).
 - A los registros sin coordenadas intenta geocodificarlos con el World Geocoding
   Service de Esri (con caché en disco para no repetir ni gastar créditos).
-- Reemplaza el contenido del Feature Layer (deleteFeatures + addFeatures).
+- Sync INCREMENTAL: compara rid (capa) con id (Supabase) y añade solo los nuevos.
 
 Pensado para correr en GitHub Actions. Solo depende de `requests`.
 
@@ -27,15 +27,35 @@ import requests
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-API_KEY      = os.environ["ARCGIS_API_KEY"]
 LAYER_URL    = os.environ["AGOL_LAYER_URL"].rstrip("/")
 DO_GEOCODE   = os.environ.get("GEOCODE", "true").lower() == "true"
 MIN_SCORE    = float(os.environ.get("GEOCODE_MIN_SCORE", "85"))
+PORTAL       = os.environ.get("ARCGIS_PORTAL", "https://www.arcgis.com")
+
+# Autenticación. Dos modos:
+#   - ARCGIS_API_KEY                            -> se usa tal cual como token
+#   - ARCGIS_CLIENT_ID + ARCGIS_CLIENT_SECRET  -> OAuth 2.0 (client credentials)
+TOKEN = None  # se resuelve en get_token()
 
 CACHE_FILE  = "geocode_cache.json"
 GEOCODE_URL = "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
 
 SELECT = "id,name,address,city,zone,lat,lng,damage_level,status,general_source,notes,created_at"
+
+
+def get_token():
+    if os.environ.get("ARCGIS_API_KEY"):
+        return os.environ["ARCGIS_API_KEY"]
+    cid = os.environ["ARCGIS_CLIENT_ID"]
+    secret = os.environ["ARCGIS_CLIENT_SECRET"]
+    r = requests.post(f"{PORTAL}/sharing/rest/oauth2/token", data={
+        "client_id": cid, "client_secret": secret,
+        "grant_type": "client_credentials", "expiration": 1440, "f": "json",
+    }, timeout=30)
+    d = r.json()
+    if "access_token" not in d:
+        raise RuntimeError(f"No se pudo obtener token OAuth: {d}")
+    return d["access_token"]
 
 
 def fetch_supabase():
@@ -54,7 +74,7 @@ def geocode_one(address, city):
         "f": "json", "singleLine": q, "maxLocations": 1,
         "countryCode": "VEN", "outFields": "Score,Match_addr",
         "forStorage": "true",          # almacenamos el resultado -> consume créditos
-        "token": API_KEY,
+        "token": TOKEN,
     }
     try:
         r = requests.get(GEOCODE_URL, params=params, timeout=30)
@@ -87,7 +107,7 @@ def save_cache(c):
 
 
 def post(endpoint, data):
-    data = dict(data, f="json", token=API_KEY)
+    data = dict(data, f="json", token=TOKEN)
     r = requests.post(f"{LAYER_URL}/{endpoint}", data=data, timeout=120)
     r.raise_for_status()
     out = r.json()
@@ -97,6 +117,8 @@ def post(endpoint, data):
 
 
 def main():
+    global TOKEN
+    TOKEN = get_token()
     rows = fetch_supabase()
     print(f"Supabase: {len(rows)} reportes")
 
@@ -124,10 +146,34 @@ def main():
         save_cache(cache)
     print(f"Geocodificados nuevos/aceptados: {geocoded}")
 
-    now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    adds = []
+    # ---- SYNC INCREMENTAL: solo añadir lo que NO está ya en la capa ----
+    # 1) rids que YA existen en el Feature Layer (paginado por si hay miles)
+    existing = set()
+    offset = 0
+    while True:
+        q = post("query", {
+            "where": "1=1", "outFields": "rid", "returnGeometry": "false",
+            "resultOffset": offset, "resultRecordCount": 2000,
+        })
+        feats = q.get("features", [])
+        for ft in feats:
+            rid = (ft.get("attributes") or {}).get("rid")
+            if rid:
+                existing.add(rid)
+        if len(feats) < 2000:
+            break
+        offset += 2000
+    print(f"Ya en la capa: {len(existing)} registros (por rid)")
+
+    # 2) Construir SOLO los nuevos: rid (= id de Supabase) que no está en la capa y con coordenadas
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    adds, sin_coords, ya_estan = [], 0, 0
     for b in rows:
         if not (b.get("lat") and b.get("lng")):
+            sin_coords += 1
+            continue
+        if b["id"] in existing:
+            ya_estan += 1
             continue
         adds.append({
             "attributes": {
@@ -136,29 +182,34 @@ def main():
                 "address": (b.get("address") or "")[:255],
                 "city": (b.get("city") or "")[:120],
                 "zone": (b.get("zone") or "")[:120],
-                "damage_level": b.get("damage_level"),
-                "status": b.get("status"),
+                "damage_level": (b.get("damage_level") or "")[:20],
+                "status": (b.get("status") or "")[:20],
                 "source": (b.get("general_source") or "")[:255],
-                "notes": (b.get("notes") or "")[:1000],
-                "coord_src": b.get("_src"),
-                "geo_score": b.get("_score"),
-                "created_at": b.get("created_at"),
+                "notes": (b.get("notes") or "")[:4000],
+                "coord_src": (b.get("_src") or "")[:30],
+                "geo_score": (str(b.get("_score")) if b.get("_score") is not None else None),
+                "created_at": (b.get("created_at") or "")[:40],
                 "synced_at": now,
             },
-            # La capa debe estar en WGS84 (wkid 4326). Ver bootstrap_layer.py.
             "geometry": {"x": b["lng"], "y": b["lat"], "spatialReference": {"wkid": 4326}},
         })
+    print(f"Nuevos por insertar: {len(adds)} (ya estaban: {ya_estan}, sin coordenadas: {sin_coords})")
 
-    deleted = post("deleteFeatures", {"where": "1=1"})
-    print(f"Borrados: {len(deleted.get('deleteResults', []))}")
-
-    added = 0
+    # 3) Insertar SOLO los nuevos (no se borra nada existente)
+    added, errors = 0, []
     for i in range(0, len(adds), 500):
         chunk = adds[i:i + 500]
-        res = post("addFeatures", {"features": json.dumps(chunk)})
-        added += sum(1 for x in res.get("addResults", []) if x.get("success"))
+        res = post("addFeatures", {"features": json.dumps(chunk), "rollbackOnFailure": "false"})
+        for x in res.get("addResults", []):
+            if x.get("success"):
+                added += 1
+            elif len(errors) < 5:
+                errors.append(x.get("error"))
+    if errors:
+        print("Ejemplos de error al insertar:", errors)
 
-    print(f"Sync OK: {len(rows)} reportes, {added} con coordenadas ({geocoded} geocodificadas).")
+    print(f"Sync OK: {len(rows)} en Supabase | {len(existing)} ya en capa | "
+          f"{added} nuevos insertados ({geocoded} geocodificadas).")
 
 
 if __name__ == "__main__":

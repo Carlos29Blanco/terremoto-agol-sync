@@ -41,12 +41,18 @@ python bootstrap_layer.py
 
 Anota la **LAYER URL** que imprime (termina en `/FeatureServer/0`).
 
-### 2. Crear una API key de ArcGIS
+### 2. Crear credenciales de ArcGIS
 
-En [ArcGIS Location Platform / Developers](https://developers.arcgis.com) crea una **API key** con:
+Si tu organización ofrece **API keys**: crea una con privilegio **Geocoding (stored)** y
+acceso de edición al item del paso 1 → usa el secret `ARCGIS_API_KEY`.
 
-- Privilegio **Geocoding (stored)**.
-- Acceso de **edición** al item del Feature Layer creado en el paso 1.
+Si **no** ofrece API keys (p. ej. organizaciones de Respuesta a Desastres), usa
+**OAuth 2.0 de aplicación**: Content → New item → Developer credentials →
+*Credenciales de OAuth 2.0 (para autenticación de aplicaciones)*. Configura:
+
+- **Privilegios**: Geocoding (stored).
+- **Item access**: añade el Feature Layer del paso 1.
+- Copia el **Client ID** y **Client Secret** → secrets `ARCGIS_CLIENT_ID` y `ARCGIS_CLIENT_SECRET`.
 
 ### 3. Configurar los Secrets del repositorio
 
@@ -56,7 +62,8 @@ En [ArcGIS Location Platform / Developers](https://developers.arcgis.com) crea u
 |---|---|
 | `SUPABASE_URL` | `https://jckifxsdlnsvbztxydes.supabase.co/rest/v1/buildings` |
 | `SUPABASE_KEY` | `sb_publishable_…` |
-| `ARCGIS_API_KEY` | tu API key |
+| `ARCGIS_CLIENT_ID` | Client ID de OAuth (o usa `ARCGIS_API_KEY` si tienes API key) |
+| `ARCGIS_CLIENT_SECRET` | Client Secret de OAuth |
 | `AGOL_LAYER_URL` | la LAYER URL del paso 1 |
 
 ### 4. Probar
