@@ -1,0 +1,5 @@
+# Solo para ejecutar bootstrap_layer.py UNA vez en local.
+# El cron (sync.py) NO necesita esto, solo requests.
+arcgis>=2.3
+pandas>=2.0
+requests>=2.31
