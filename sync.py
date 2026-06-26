@@ -27,15 +27,35 @@ import requests
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-API_KEY      = os.environ["ARCGIS_API_KEY"]
 LAYER_URL    = os.environ["AGOL_LAYER_URL"].rstrip("/")
 DO_GEOCODE   = os.environ.get("GEOCODE", "true").lower() == "true"
 MIN_SCORE    = float(os.environ.get("GEOCODE_MIN_SCORE", "85"))
+PORTAL       = os.environ.get("ARCGIS_PORTAL", "https://www.arcgis.com")
+
+# Autenticación. Dos modos:
+#   - ARCGIS_API_KEY                            -> se usa tal cual como token
+#   - ARCGIS_CLIENT_ID + ARCGIS_CLIENT_SECRET  -> OAuth 2.0 (client credentials)
+TOKEN = None  # se resuelve en get_token()
 
 CACHE_FILE  = "geocode_cache.json"
 GEOCODE_URL = "https://geocode-api.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
 
 SELECT = "id,name,address,city,zone,lat,lng,damage_level,status,general_source,notes,created_at"
+
+
+def get_token():
+    if os.environ.get("ARCGIS_API_KEY"):
+        return os.environ["ARCGIS_API_KEY"]
+    cid = os.environ["ARCGIS_CLIENT_ID"]
+    secret = os.environ["ARCGIS_CLIENT_SECRET"]
+    r = requests.post(f"{PORTAL}/sharing/rest/oauth2/token", data={
+        "client_id": cid, "client_secret": secret,
+        "grant_type": "client_credentials", "expiration": 1440, "f": "json",
+    }, timeout=30)
+    d = r.json()
+    if "access_token" not in d:
+        raise RuntimeError(f"No se pudo obtener token OAuth: {d}")
+    return d["access_token"]
 
 
 def fetch_supabase():
@@ -54,7 +74,7 @@ def geocode_one(address, city):
         "f": "json", "singleLine": q, "maxLocations": 1,
         "countryCode": "VEN", "outFields": "Score,Match_addr",
         "forStorage": "true",          # almacenamos el resultado -> consume créditos
-        "token": API_KEY,
+        "token": TOKEN,
     }
     try:
         r = requests.get(GEOCODE_URL, params=params, timeout=30)
@@ -87,7 +107,7 @@ def save_cache(c):
 
 
 def post(endpoint, data):
-    data = dict(data, f="json", token=API_KEY)
+    data = dict(data, f="json", token=TOKEN)
     r = requests.post(f"{LAYER_URL}/{endpoint}", data=data, timeout=120)
     r.raise_for_status()
     out = r.json()
@@ -97,6 +117,8 @@ def post(endpoint, data):
 
 
 def main():
+    global TOKEN
+    TOKEN = get_token()
     rows = fetch_supabase()
     print(f"Supabase: {len(rows)} reportes")
 
